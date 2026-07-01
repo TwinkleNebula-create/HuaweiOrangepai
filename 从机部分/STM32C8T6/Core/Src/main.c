@@ -19,7 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "tim.h"
-#include "usb_device.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -45,6 +45,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static uint8_t uart1_rx_byte;
 
 /* USER CODE END PV */
 
@@ -52,18 +53,68 @@
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void Motor_SetSpeed(uint16_t speed);
+static void Motor_HandleCommand(uint8_t command);
+static void UART1_StartReceive(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 /**
- * @brief  设置 A 路电机 PWM 占空比（仅正转）
- * @param  speed: 0=停止, 300=30%, 600=60%, 999=全速
+ * @brief  Set motor PWM compare value.
+ * @param  speed: 0, 300, 600, or 999.
  */
 void Motor_SetSpeed(uint16_t speed)
 {
+  if (speed > 999U)
+  {
+    speed = 999U;
+  }
+
   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, speed);
+}
+
+static void Motor_HandleCommand(uint8_t command)
+{
+  switch (command)
+  {
+    case '0':
+      Motor_SetSpeed(0);
+      break;
+    case '1':
+      Motor_SetSpeed(300);
+      break;
+    case '2':
+      Motor_SetSpeed(600);
+      break;
+    case '3':
+      Motor_SetSpeed(999);
+      break;
+    default:
+      break;
+  }
+}
+
+static void UART1_StartReceive(void)
+{
+  HAL_UART_Receive_IT(&huart1, &uart1_rx_byte, 1);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    Motor_HandleCommand(uart1_rx_byte);
+    UART1_StartReceive();
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    UART1_StartReceive();
+  }
 }
 
 /* USER CODE END 0 */
@@ -98,7 +149,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_TIM2_Init();
-  MX_USB_DEVICE_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* 启动 TIM2_CH1 PWM 输出 */
@@ -110,8 +161,9 @@ int main(void)
   HAL_GPIO_WritePin(AIN1_GPIO_Port, AIN1_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(AIN2_GPIO_Port, AIN2_Pin, GPIO_PIN_RESET);
 
-  /* 上电默认停止，等待 USB CDC 命令 */
+  /* Power-on default: stop and wait for USART1 commands. */
   Motor_SetSpeed(0);
+  UART1_StartReceive();
 
   /* USER CODE END 2 */
 
@@ -122,7 +174,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* 电机速度由 USB CDC 接收回调直接设置，主循环无需操作 */
+    /* Motor speed is updated from the USART1 receive callback. */
   }
   /* USER CODE END 3 */
 }
@@ -135,7 +187,6 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -162,12 +213,6 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB;
-  PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_PLL_DIV1_5;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
   }

@@ -27,14 +27,7 @@ stm32c8t6\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_flash_ex.h
 stm32c8t6\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_pwr.h
 stm32c8t6\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_tim.h
 stm32c8t6\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_tim_ex.h
-stm32c8t6\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_pcd.h
-stm32c8t6\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_ll_usb.h
-stm32c8t6\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_pcd_ex.h
+stm32c8t6\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h
 stm32c8t6\main.o: ../Core/Inc/tim.h
-stm32c8t6\main.o: ../USB_DEVICE/App/usb_device.h
-stm32c8t6\main.o: ../Middlewares/ST/STM32_USB_Device_Library/Core/Inc/usbd_def.h
-stm32c8t6\main.o: ../USB_DEVICE/Target/usbd_conf.h
-stm32c8t6\main.o: C:\Keil5\ARM\ARMCC\Bin\..\include\stdio.h
-stm32c8t6\main.o: C:\Keil5\ARM\ARMCC\Bin\..\include\stdlib.h
-stm32c8t6\main.o: C:\Keil5\ARM\ARMCC\Bin\..\include\string.h
+stm32c8t6\main.o: ../Core/Inc/usart.h
 stm32c8t6\main.o: ../Core/Inc/gpio.h
