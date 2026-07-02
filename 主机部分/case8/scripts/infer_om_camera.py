@@ -64,7 +64,7 @@ def parse_args():
     # --serial-dry-run 不打开真实串口，只打印将要发送的命令，适合先测试映射关系。
     parser.add_argument("--serial-port", default=None, help="STM32 USB CDC device, for example /dev/ttyACM0.")
     parser.add_argument("--serial-baudrate", default=115200, type=int)
-    parser.add_argument("--serial-min-interval", default=0.2, type=float, help="Minimum seconds between repeated sends.")
+    parser.add_argument("--serial-min-interval", default=1.0, type=float, help="Seconds a command must stay stable before sending.")
     parser.add_argument("--serial-dry-run", action="store_true", help="Print STM32 commands instead of opening the serial port.")
     return parser.parse_args()
 

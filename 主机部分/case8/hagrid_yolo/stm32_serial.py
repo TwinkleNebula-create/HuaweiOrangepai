@@ -20,19 +20,27 @@ import time
 
 # 这个字典就是最重要、最常修改的参数表。
 # 左边 key：模型识别出来的手势标签，来自 models/YOLOv10n_gestures_labels.txt。
-# 右边 value：真正发给 STM32 的 1 个 ASCII 命令字符。
+# 右边 value：真正发给 STM32 的 ASCII 命令，可以是 '0' 这种单字节，也可以是 switch/palm 这种短文本。
 #
 # 你现在的 STM32 从机代码已经能识别这些字符：
 # '0' -> Motor_SetSpeed(0)，停止
 # '1' -> Motor_SetSpeed(300)，低速
 # '2' -> Motor_SetSpeed(600)，中速
 # '3' -> Motor_SetSpeed(999)，高速
+# switch -> 首页切换菜单
+# like/dislike -> 进入/退出界面
+# palm/fist -> 舵机页开门/关门
 #
 # 例子：如果你想让 like 手势表示高速，就加一行："like": "3"。
 DEFAULT_GESTURE_COMMANDS = {
     "stop": "0",
     "stop_inverted": "0",
-    "palm": "0",
+    "palm": "palm",
+    "fist": "fist",
+    "like": "like",
+    "dislike": "dislike",
+    "thumb_index": "switch",
+    "three_gun": "switch",
     "one": "1",
     "two_up": "2",
     "peace": "2",    
@@ -42,7 +50,6 @@ DEFAULT_GESTURE_COMMANDS = {
     "three2": "3",
     "three3": "3",
 }
-
 
 class Stm32SerialController:
     """把 YOLO 检测结果转换成 STM32 串口命令。
@@ -58,7 +65,7 @@ class Stm32SerialController:
         self,
         port,
         baudrate=115200,
-        min_interval=0.2,
+        min_interval=1.0,
         default_command="0",
         gesture_commands=None,
         dry_run=False,
@@ -67,7 +74,7 @@ class Stm32SerialController:
         self.port = port
         # baudrate 是波特率。USB CDC 有时不严格依赖它，但 pyserial 打开串口时仍需要这个参数。
         self.baudrate = baudrate
-        # min_interval 是重复发送限频时间，防止同一个命令在很短时间内疯狂发送。
+        # min_interval 是命令稳定时间，防止手势切换途中短暂误识别被发送。
         self.min_interval = max(0.0, min_interval)
         # default_command 是默认命令。识别不到手势或手势没有配置时，默认发 '0' 停止电机。
         self.default_command = default_command
@@ -79,6 +86,9 @@ class Stm32SerialController:
         self._serial = None
         self._last_command = None
         self._last_send_time = 0.0
+        self._pending_command = None
+        self._pending_label = None
+        self._pending_since = 0.0
 
         if not dry_run:
             # 只有真正启用串口时才导入 pyserial。
@@ -109,21 +119,33 @@ class Stm32SerialController:
         label = self._select_label(detections, labels)
         # 第二步：把手势标签查表转换成 STM32 命令。查不到就用 default_command，也就是停止。
         command = self.gesture_commands.get(label, self.default_command)
-        # 第三步：真正发送命令字符。
-        self.send_command(command, label)
+        now = time.time()
+
+        if command != self._pending_command:
+            self._pending_command = command
+            self._pending_label = label
+            self._pending_since = now
+        else:
+            self._pending_label = label
+
+        if now - self._pending_since < self.min_interval:
+            return
+
+        # 第三步：命令稳定足够久之后，真正发送命令字符。
+        self.send_command(command, self._pending_label)
 
     def send_command(self, command, label=None):
         """向 STM32 发送 1 个 ASCII 命令字符。
 
         注意：这里不是发送完整 JSON，也不是发送手势名字。
-        实际发送的只有一个字节，例如 b'0' 或 b'3'。
-        STM32 收到这个字符后，在 USB CDC 接收回调里决定 PWM 数值。
+        实际发送的是一个短 ASCII 命令，例如 b'0'、b'3' 或 b'switch'。
+        STM32 收到命令后，会结合当前 OLED 页面决定具体动作。
         """
         now = time.time()
 
-        # 如果命令没变，并且距离上次发送还没超过 min_interval，就不重复发送。
+        # 同一个命令已经发过时，不再重复发送。
         # 这样同一个手势一直在镜头前时，串口不会被重复命令刷屏。
-        if command == self._last_command and now - self._last_send_time < self.min_interval:
+        if command == self._last_command:
             return
 
         if self.dry_run:
