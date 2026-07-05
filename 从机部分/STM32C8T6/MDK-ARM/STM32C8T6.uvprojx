@@ -538,6 +538,11 @@
               <FileType>1</FileType>
               <FilePath>../App/oled.c</FilePath>
             </File>
+            <File>
+              <FileName>rfid_reader.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/rfid_reader.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

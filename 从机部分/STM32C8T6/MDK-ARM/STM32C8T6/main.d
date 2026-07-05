@@ -34,3 +34,4 @@ stm32c8t6\main.o: ../Core/Inc/tim.h
 stm32c8t6\main.o: ../Core/Inc/usart.h
 stm32c8t6\main.o: ../Core/Inc/gpio.h
 stm32c8t6\main.o: ../App/oled.h
+stm32c8t6\main.o: ../App/rfid_reader.h

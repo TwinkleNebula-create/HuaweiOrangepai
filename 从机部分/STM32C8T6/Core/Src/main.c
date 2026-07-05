@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 /* OLED 应用层接口：底层驱动在 App/oled.c，主程序只负责初始化和状态刷新。 */
 #include "oled.h"
+#include "rfid_reader.h"
 
 /* USER CODE END Includes */
 
@@ -40,6 +41,16 @@
 #define SERVO_CLOSED_PULSE  1000U
 #define SERVO_OPEN_PULSE    2000U
 #define SERVO_OLED_SETTLE_MS  300U
+#define APP_UNLOCK_MESSAGE_MS  900U
+#define APP_UNLOCK_CODE_LENGTH  4U
+#define APP_MESSAGE_NONE        0U
+#define APP_MESSAGE_UNLOCK_OK   1U
+#define APP_MESSAGE_LOCK_FAIL   2U
+#define APP_MESSAGE_ENROLL_OK   3U
+#define APP_MESSAGE_MODIFY_OK   4U
+#define APP_LOCK_ERROR_MS       1000U
+#define APP_GESTURE_ENROLL_COUNTDOWN_MAX  3U
+#define APP_GESTURE_ENROLL_STEP_MS        1000U
 
 /* USER CODE END PD */
 
@@ -52,12 +63,16 @@
 
 /* USER CODE BEGIN PV */
 static uint8_t uart1_rx_byte;
+static uint8_t uart2_rx_byte;
 
 typedef enum
 {
   APP_PAGE_HOME = 0,
   APP_PAGE_MOTOR = 1,
-  APP_PAGE_SERVO = 2
+  APP_PAGE_SERVO = 2,
+  APP_PAGE_LOCK = 3,
+  APP_PAGE_RFID_ENROLL = 4,
+  APP_PAGE_GESTURE_ENROLL = 5
 } AppPage;
 
 /*
@@ -75,8 +90,23 @@ static volatile uint8_t page_redraw_pending = 0U;
 static volatile uint8_t servo_door_state = (uint8_t)OLED_DOOR_CLOSED;
 static volatile uint8_t servo_display_pending = 0U;
 static volatile uint32_t servo_display_due_tick = 0U;
+static volatile uint8_t access_unlocked = 0U;
+static volatile uint8_t access_unlock_pending = 0U;
+static volatile uint8_t unlock_code_index = 0U;
+static uint8_t unlock_input_code[APP_UNLOCK_CODE_LENGTH];
+static volatile uint8_t lock_error_pending = 0U;
+static volatile uint32_t lock_error_due_tick = 0U;
+static volatile uint8_t access_message_pending = 0U;
+static volatile uint8_t access_message_mode = APP_MESSAGE_NONE;
+static volatile uint32_t access_message_due_tick = 0U;
 static char uart_cmd_buffer[8];
 static uint8_t uart_cmd_len = 0U;
+static uint8_t unlock_code[APP_UNLOCK_CODE_LENGTH] = {'1', '2', '3', '4'};
+static uint8_t gesture_enroll_code[APP_UNLOCK_CODE_LENGTH];
+static volatile uint8_t gesture_enroll_index = 0U;
+static volatile uint8_t gesture_enroll_recording = 0U;
+static volatile uint8_t gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
+static volatile uint32_t gesture_enroll_due_tick = 0U;
 
 /* USER CODE END PV */
 
@@ -91,6 +121,20 @@ static uint8_t UART1_CommandIsPrefix(const char *command, uint8_t length);
 static void App_HandleTextCommand(const char *command);
 static void UART1_ProcessRxByte(uint8_t byte);
 static void UART1_StartReceive(void);
+static void UART2_StartReceive(void);
+static void App_EnterHomeAfterUnlock(void);
+static void App_ReturnHome(void);
+static void App_LockAndShow(void);
+static void App_OpenHomeItem(uint8_t item);
+static void App_SelectHomeItem(uint8_t item);
+static void App_HandleUnlockByte(uint8_t byte);
+static void App_HandleLockErrorTimer(void);
+static void App_StartGestureEnroll(void);
+static void App_StartGestureEnrollStep(void);
+static void App_HandleGestureEnrollByte(uint8_t byte);
+static void App_HandleGestureInvalid(void);
+static void App_HandleGestureEnrollTimer(void);
+static void App_HandleRfidEvents(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -187,7 +231,7 @@ static uint8_t App_StringEquals(const char *a, const char *b)
 
 static uint8_t UART1_CommandIsPrefix(const char *command, uint8_t length)
 {
-  static const char *known_commands[] = {"left", "right", "ok", "exit", "open", "close", "switch", "like", "dislike", "palm", "fist"};
+  static const char *known_commands[] = {"ok", "exit", "open", "close", "like", "dislike", "palm", "fist", "invalid"};
   uint8_t i;
   uint8_t j;
   uint8_t matched;
@@ -215,43 +259,38 @@ static uint8_t UART1_CommandIsPrefix(const char *command, uint8_t length)
 
 static void App_HandleTextCommand(const char *command)
 {
-  uint8_t old_selection;
+  if ((app_page == (uint8_t)APP_PAGE_HOME) &&
+      ((App_StringEquals(command, "exit") != 0U) || (App_StringEquals(command, "dislike") != 0U)))
+  {
+    App_LockAndShow();
+    return;
+  }
 
   if ((app_page != (uint8_t)APP_PAGE_HOME) &&
       ((App_StringEquals(command, "exit") != 0U) || (App_StringEquals(command, "dislike") != 0U)))
   {
-    app_page = (uint8_t)APP_PAGE_HOME;
-    page_redraw_pending = 1U;
+    App_ReturnHome();
     return;
   }
 
   if (app_page == (uint8_t)APP_PAGE_HOME)
   {
-    if ((App_StringEquals(command, "left") != 0U) ||
-        (App_StringEquals(command, "right") != 0U) ||
-        (App_StringEquals(command, "switch") != 0U))
-    {
-      old_selection = home_selection;
-      if (App_StringEquals(command, "switch") != 0U)
-      {
-        home_selection = (home_selection == (uint8_t)OLED_HOME_MOTOR) ? (uint8_t)OLED_HOME_SERVO : (uint8_t)OLED_HOME_MOTOR;
-      }
-      else
-      {
-        home_selection = (App_StringEquals(command, "left") != 0U) ? (uint8_t)OLED_HOME_MOTOR : (uint8_t)OLED_HOME_SERVO;
-      }
-      if (old_selection != home_selection)
-      {
-        home_selection_old = old_selection;
-        home_transition_pending = 1U;
-      }
-      return;
-    }
-
     if ((App_StringEquals(command, "ok") != 0U) || (App_StringEquals(command, "like") != 0U))
     {
-      app_page = (home_selection == (uint8_t)OLED_HOME_MOTOR) ? (uint8_t)APP_PAGE_MOTOR : (uint8_t)APP_PAGE_SERVO;
-      page_redraw_pending = 1U;
+      App_OpenHomeItem(home_selection);
+    }
+    return;
+  }
+
+  if (app_page == (uint8_t)APP_PAGE_GESTURE_ENROLL)
+  {
+    if ((App_StringEquals(command, "ok") != 0U) || (App_StringEquals(command, "like") != 0U))
+    {
+      App_StartGestureEnrollStep();
+    }
+    else if (App_StringEquals(command, "invalid") != 0U)
+    {
+      App_HandleGestureInvalid();
     }
     return;
   }
@@ -273,6 +312,12 @@ static void UART1_ProcessRxByte(uint8_t byte)
 {
   char ch;
 
+  if (access_unlocked == 0U)
+  {
+    App_HandleUnlockByte(byte);
+    return;
+  }
+
   if ((byte >= (uint8_t)'A') && (byte <= (uint8_t)'Z'))
   {
     byte = (uint8_t)(byte + ((uint8_t)'a' - (uint8_t)'A'));
@@ -283,15 +328,23 @@ static void UART1_ProcessRxByte(uint8_t byte)
     uart_cmd_len = 0U;
     uart_cmd_buffer[0] = '\0';
 
-    if ((app_page == (uint8_t)APP_PAGE_MOTOR) && (byte <= (uint8_t)'3'))
+    if ((app_page == (uint8_t)APP_PAGE_HOME) && (byte >= (uint8_t)'1') && (byte <= (uint8_t)'4'))
+    {
+      App_SelectHomeItem((uint8_t)(byte - (uint8_t)'1'));
+    }
+    else if (app_page == (uint8_t)APP_PAGE_GESTURE_ENROLL)
+    {
+      App_HandleGestureEnrollByte(byte);
+    }
+    else if ((app_page == (uint8_t)APP_PAGE_MOTOR) && (byte <= (uint8_t)'3'))
     {
       Motor_HandleCommand(byte);
     }
-    else if ((app_page == (uint8_t)APP_PAGE_SERVO) && (byte == (uint8_t)'4'))
+    else if ((app_page == (uint8_t)APP_PAGE_SERVO) && (byte == (uint8_t)'5'))
     {
       Servo_SetDoor(1U);
     }
-    else if ((app_page == (uint8_t)APP_PAGE_SERVO) && (byte == (uint8_t)'5'))
+    else if ((app_page == (uint8_t)APP_PAGE_SERVO) && (byte == (uint8_t)'0'))
     {
       Servo_SetDoor(0U);
     }
@@ -322,17 +375,15 @@ static void UART1_ProcessRxByte(uint8_t byte)
   uart_cmd_len++;
   uart_cmd_buffer[uart_cmd_len] = '\0';
 
-  if ((App_StringEquals(uart_cmd_buffer, "left") != 0U) ||
-      (App_StringEquals(uart_cmd_buffer, "right") != 0U) ||
-      (App_StringEquals(uart_cmd_buffer, "ok") != 0U) ||
+  if ((App_StringEquals(uart_cmd_buffer, "ok") != 0U) ||
       (App_StringEquals(uart_cmd_buffer, "exit") != 0U) ||
       (App_StringEquals(uart_cmd_buffer, "open") != 0U) ||
       (App_StringEquals(uart_cmd_buffer, "close") != 0U) ||
-      (App_StringEquals(uart_cmd_buffer, "switch") != 0U) ||
       (App_StringEquals(uart_cmd_buffer, "like") != 0U) ||
       (App_StringEquals(uart_cmd_buffer, "dislike") != 0U) ||
       (App_StringEquals(uart_cmd_buffer, "palm") != 0U) ||
-      (App_StringEquals(uart_cmd_buffer, "fist") != 0U))
+      (App_StringEquals(uart_cmd_buffer, "fist") != 0U) ||
+      (App_StringEquals(uart_cmd_buffer, "invalid") != 0U))
   {
     App_HandleTextCommand(uart_cmd_buffer);
     uart_cmd_len = 0U;
@@ -351,6 +402,322 @@ static void UART1_StartReceive(void)
   HAL_UART_Receive_IT(&huart1, &uart1_rx_byte, 1);
 }
 
+static void UART2_StartReceive(void)
+{
+  HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1);
+}
+
+static void App_EnterHomeAfterUnlock(void)
+{
+  access_unlocked = 1U;
+  app_page = (uint8_t)APP_PAGE_HOME;
+  home_selection = (uint8_t)OLED_HOME_MOTOR;
+  home_selection_old = (uint8_t)OLED_HOME_MOTOR;
+  home_transition_pending = 0U;
+  page_redraw_pending = 1U;
+}
+
+static void App_ReturnHome(void)
+{
+  Motor_SetSpeed(0U);
+  Servo_SetDoor(0U);
+  gesture_enroll_index = 0U;
+  gesture_enroll_recording = 0U;
+  gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
+  gesture_enroll_due_tick = 0U;
+  app_page = (uint8_t)APP_PAGE_HOME;
+  home_selection = (uint8_t)OLED_HOME_MOTOR;
+  home_selection_old = (uint8_t)OLED_HOME_MOTOR;
+  home_transition_pending = 0U;
+  page_redraw_pending = 1U;
+}
+
+static void App_LockAndShow(void)
+{
+  Motor_SetSpeed(0U);
+  Servo_SetDoor(0U);
+  RFID_Lock();
+  access_unlocked = 0U;
+  access_unlock_pending = 0U;
+  unlock_code_index = 0U;
+  lock_error_pending = 0U;
+  lock_error_due_tick = 0U;
+  gesture_enroll_index = 0U;
+  gesture_enroll_recording = 0U;
+  gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
+  gesture_enroll_due_tick = 0U;
+  access_message_pending = 0U;
+  access_message_mode = APP_MESSAGE_NONE;
+  app_page = (uint8_t)APP_PAGE_LOCK;
+  home_selection = (uint8_t)OLED_HOME_MOTOR;
+  home_selection_old = (uint8_t)OLED_HOME_MOTOR;
+  home_transition_pending = 0U;
+  page_redraw_pending = 1U;
+}
+
+static void App_HandleUnlockByte(uint8_t byte)
+{
+  uint8_t i;
+  uint8_t matched;
+
+  if (lock_error_pending != 0U)
+  {
+    return;
+  }
+
+  if ((byte < (uint8_t)'0') || (byte > (uint8_t)'9'))
+  {
+    return;
+  }
+
+  if (unlock_code_index < APP_UNLOCK_CODE_LENGTH)
+  {
+    unlock_input_code[unlock_code_index] = byte;
+    unlock_code_index++;
+    OLED_ShowLockInputPage(unlock_input_code, unlock_code_index, 0U);
+  }
+
+  if (unlock_code_index >= APP_UNLOCK_CODE_LENGTH)
+  {
+    matched = 1U;
+    for (i = 0U; i < APP_UNLOCK_CODE_LENGTH; i++)
+    {
+      if (unlock_input_code[i] != unlock_code[i])
+      {
+        matched = 0U;
+        break;
+      }
+    }
+
+    unlock_code_index = 0U;
+    if (matched != 0U)
+    {
+      access_unlocked = 1U;
+      access_unlock_pending = 1U;
+    }
+    else
+    {
+      lock_error_pending = 1U;
+      lock_error_due_tick = HAL_GetTick() + APP_LOCK_ERROR_MS;
+      OLED_ShowLockInputPage(unlock_input_code, APP_UNLOCK_CODE_LENGTH, 1U);
+    }
+  }
+}
+
+static void App_HandleLockErrorTimer(void)
+{
+  if ((lock_error_pending != 0U) && ((int32_t)(HAL_GetTick() - lock_error_due_tick) >= 0))
+  {
+    lock_error_pending = 0U;
+    unlock_code_index = 0U;
+    OLED_ShowLockInputPage(unlock_input_code, 0U, 0U);
+  }
+}
+
+static void App_OpenHomeItem(uint8_t item)
+{
+  switch (item)
+  {
+    case OLED_HOME_MOTOR:
+      app_page = (uint8_t)APP_PAGE_MOTOR;
+      break;
+    case OLED_HOME_SERVO:
+      app_page = (uint8_t)APP_PAGE_SERVO;
+      break;
+    case OLED_HOME_RFID:
+      RFID_StartEnroll();
+      app_page = (uint8_t)APP_PAGE_RFID_ENROLL;
+      break;
+    case OLED_HOME_GESTURE:
+      App_StartGestureEnroll();
+      break;
+    default:
+      app_page = (uint8_t)APP_PAGE_HOME;
+      break;
+  }
+
+  page_redraw_pending = 1U;
+}
+
+static void App_SelectHomeItem(uint8_t item)
+{
+  if (item >= (uint8_t)OLED_HOME_COUNT)
+  {
+    return;
+  }
+
+  home_selection = item;
+  home_selection_old = item;
+  home_transition_pending = 0U;
+  page_redraw_pending = 1U;
+}
+
+static void App_StartGestureEnroll(void)
+{
+  gesture_enroll_index = 0U;
+  gesture_enroll_recording = 0U;
+  gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
+  gesture_enroll_due_tick = 0U;
+  app_page = (uint8_t)APP_PAGE_GESTURE_ENROLL;
+}
+
+static void App_StartGestureEnrollStep(void)
+{
+  if ((gesture_enroll_index >= APP_UNLOCK_CODE_LENGTH) || (gesture_enroll_recording != 0U))
+  {
+    return;
+  }
+
+  gesture_enroll_recording = 1U;
+  gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
+  gesture_enroll_due_tick = HAL_GetTick() + APP_GESTURE_ENROLL_STEP_MS;
+  page_redraw_pending = 1U;
+}
+
+static void App_HandleGestureEnrollByte(uint8_t byte)
+{
+  uint8_t i;
+
+  if ((gesture_enroll_recording == 0U) || (byte < (uint8_t)'0') || (byte > (uint8_t)'5'))
+  {
+    return;
+  }
+
+  if (gesture_enroll_index < APP_UNLOCK_CODE_LENGTH)
+  {
+    gesture_enroll_code[gesture_enroll_index] = byte;
+    gesture_enroll_index++;
+  }
+
+  if (gesture_enroll_index >= APP_UNLOCK_CODE_LENGTH)
+  {
+    gesture_enroll_recording = 0U;
+    gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
+    gesture_enroll_due_tick = 0U;
+    for (i = 0U; i < APP_UNLOCK_CODE_LENGTH; i++)
+    {
+      unlock_code[i] = gesture_enroll_code[i];
+    }
+    unlock_code_index = 0U;
+    access_message_pending = 1U;
+    access_message_mode = APP_MESSAGE_MODIFY_OK;
+    access_message_due_tick = HAL_GetTick() + APP_UNLOCK_MESSAGE_MS;
+    OLED_ShowModifySuccessPage();
+  }
+  else
+  {
+    gesture_enroll_recording = 0U;
+    gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
+    gesture_enroll_due_tick = 0U;
+    page_redraw_pending = 1U;
+  }
+}
+
+static void App_HandleGestureInvalid(void)
+{
+  if (app_page != (uint8_t)APP_PAGE_GESTURE_ENROLL)
+  {
+    return;
+  }
+
+  gesture_enroll_recording = 0U;
+  gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
+  gesture_enroll_due_tick = 0U;
+  page_redraw_pending = 1U;
+}
+
+static void App_HandleGestureEnrollTimer(void)
+{
+  if ((app_page != (uint8_t)APP_PAGE_GESTURE_ENROLL) || (gesture_enroll_recording == 0U) || (access_message_pending != 0U))
+  {
+    return;
+  }
+
+  if ((int32_t)(HAL_GetTick() - gesture_enroll_due_tick) >= 0)
+  {
+    if (gesture_enroll_countdown > 1U)
+    {
+      gesture_enroll_countdown--;
+      gesture_enroll_due_tick = HAL_GetTick() + APP_GESTURE_ENROLL_STEP_MS;
+      page_redraw_pending = 1U;
+    }
+    else
+    {
+      App_HandleGestureInvalid();
+    }
+  }
+}
+
+static void App_HandleRfidEvents(void)
+{
+  RFID_Event event;
+  uint8_t card_id[RFID_CARD_ID_LENGTH];
+  uint8_t retry_count;
+  uint8_t unlock_pending;
+
+  __disable_irq();
+  unlock_pending = access_unlock_pending;
+  access_unlock_pending = 0U;
+  __enable_irq();
+
+  if (unlock_pending != 0U)
+  {
+    access_message_pending = 1U;
+    access_message_mode = APP_MESSAGE_UNLOCK_OK;
+    access_message_due_tick = HAL_GetTick() + APP_UNLOCK_MESSAGE_MS;
+    OLED_ShowUnlockSuccessPage();
+  }
+
+  event = RFID_PollEvent(card_id, &retry_count);
+  if (event == RFID_EVENT_AUTHORIZED)
+  {
+    if (access_unlocked == 0U)
+    {
+      access_unlocked = 1U;
+      access_message_pending = 1U;
+      access_message_mode = APP_MESSAGE_UNLOCK_OK;
+      access_message_due_tick = HAL_GetTick() + APP_UNLOCK_MESSAGE_MS;
+      OLED_ShowUnlockSuccessPage();
+    }
+  }
+  else if (event == RFID_EVENT_DENIED)
+  {
+    if (access_unlocked == 0U)
+    {
+      access_message_pending = 1U;
+      access_message_mode = APP_MESSAGE_LOCK_FAIL;
+      access_message_due_tick = HAL_GetTick() + APP_UNLOCK_MESSAGE_MS;
+      OLED_ShowUnlockDeniedPage(retry_count);
+    }
+  }
+  else if (event == RFID_EVENT_ENROLLED)
+  {
+    access_message_pending = 1U;
+    access_message_mode = APP_MESSAGE_ENROLL_OK;
+    access_message_due_tick = HAL_GetTick() + APP_UNLOCK_MESSAGE_MS;
+    OLED_ShowRfidEnrollSuccessPage();
+  }
+
+  if ((access_message_pending != 0U) && ((int32_t)(HAL_GetTick() - access_message_due_tick) >= 0))
+  {
+    access_message_pending = 0U;
+    if (access_message_mode == APP_MESSAGE_UNLOCK_OK)
+    {
+      App_EnterHomeAfterUnlock();
+    }
+    else if ((access_message_mode == APP_MESSAGE_ENROLL_OK) || (access_message_mode == APP_MESSAGE_MODIFY_OK))
+    {
+      App_ReturnHome();
+    }
+    else
+    {
+      app_page = (uint8_t)APP_PAGE_LOCK;
+      OLED_ShowLockPage();
+    }
+    access_message_mode = APP_MESSAGE_NONE;
+  }
+}
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1)
@@ -358,6 +725,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     /* 串口中断里只处理命令和更新 PWM，不在这里刷 OLED，保证中断尽快退出。 */
     UART1_ProcessRxByte(uart1_rx_byte);
     UART1_StartReceive();
+  }
+  else if (huart->Instance == USART2)
+  {
+    RFID_ProcessByte(uart2_rx_byte);
+    UART2_StartReceive();
   }
 }
 
@@ -367,6 +739,10 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   {
     /* 串口出错后重新打开接收，避免一次错误导致后续指令都收不到。 */
     UART1_StartReceive();
+  }
+  else if (huart->Instance == USART2)
+  {
+    UART2_StartReceive();
   }
 }
 
@@ -405,7 +781,10 @@ int main(void)
   MX_USART1_UART_Init();
   MX_SPI1_Init();
   MX_TIM4_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+
+  RFID_Init();
 
   /* 启动 TIM2_CH1 PWM 输出 */
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
@@ -420,7 +799,9 @@ int main(void)
   /* SPI1 和 DC/RES/CS GPIO 初始化完成后，再初始化 OLED 并绘制默认停止页面。 */
   OLED_Init();
   OLED_PlayBootAnimation();
-  OLED_ShowHomePage(OLED_HOME_MOTOR);
+  OLED_ShowLockPage();
+  app_page = (uint8_t)APP_PAGE_LOCK;
+  access_unlocked = 0U;
 
   /* 上电默认停止，随后等待 USART1 接收上位机发送的 0/1/2/3 指令。 */
   Motor_SetSpeed(0);
@@ -432,6 +813,7 @@ int main(void)
   home_transition_pending = 0U;
   page_redraw_pending = 0U;
   UART1_StartReceive();
+  UART2_StartReceive();
 
   /* USER CODE END 2 */
 
@@ -443,6 +825,10 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     uint8_t servo_update_due;
+
+    App_HandleRfidEvents();
+    App_HandleLockErrorTimer();
+    App_HandleGestureEnrollTimer();
 
     servo_update_due = ((servo_display_pending != 0U) && ((int32_t)(HAL_GetTick() - servo_display_due_tick) >= 0)) ? 1U : 0U;
 
@@ -497,9 +883,21 @@ int main(void)
         {
           OLED_ShowMotorPage((OLED_MotorState)motor_state);
         }
-        else
+        else if (page == (uint8_t)APP_PAGE_SERVO)
         {
           OLED_ShowServoPage((OLED_DoorState)door_state);
+        }
+        else if (page == (uint8_t)APP_PAGE_RFID_ENROLL)
+        {
+          OLED_ShowRfidEnrollPage();
+        }
+        else if (page == (uint8_t)APP_PAGE_GESTURE_ENROLL)
+        {
+          OLED_ShowGestureEnrollPage(gesture_enroll_index, gesture_enroll_countdown, gesture_enroll_recording, gesture_enroll_code);
+        }
+        else
+        {
+          OLED_ShowLockPage();
         }
       }
 

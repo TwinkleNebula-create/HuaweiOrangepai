@@ -8,6 +8,7 @@
 "stm32c8t6\stm32f1xx_it.o"
 "stm32c8t6\stm32f1xx_hal_msp.o"
 "stm32c8t6\oled.o"
+"stm32c8t6\rfid_reader.o"
 "stm32c8t6\stm32f1xx_hal_gpio_ex.o"
 "stm32c8t6\stm32f1xx_hal_spi.o"
 "stm32c8t6\stm32f1xx_hal.o"

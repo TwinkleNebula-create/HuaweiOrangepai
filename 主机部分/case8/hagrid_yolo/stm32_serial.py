@@ -20,35 +20,50 @@ import time
 
 # 这个字典就是最重要、最常修改的参数表。
 # 左边 key：模型识别出来的手势标签，来自 models/YOLOv10n_gestures_labels.txt。
-# 右边 value：真正发给 STM32 的 ASCII 命令，可以是 '0' 这种单字节，也可以是 switch/palm 这种短文本。
+# 右边 value：真正发给 STM32 的 ASCII 命令，可以是 '0' 这种单字节，也可以是 palm/open 这种短文本。
 #
-# 你现在的 STM32 从机代码已经能识别这些字符：
-# '0' -> Motor_SetSpeed(0)，停止
-# '1' -> Motor_SetSpeed(300)，低速
-# '2' -> Motor_SetSpeed(600)，中速
-# '3' -> Motor_SetSpeed(999)，高速
-# switch -> 首页切换菜单
-# like/dislike -> 进入/退出界面
-# palm/fist -> 舵机页开门/关门
+# 串口命令对应关系：
+# 锁屏页：'1'/'2'/'3'/'4' 依次输入 1234 解锁；默认手势密码也是 1234。
+# 首页：'1'/'2'/'3'/'4' 只选中电机/舵机/读卡器/手势录入，ok/like 才进入。
+# 手势录入页：先发 ok/like 开始当前项倒计时，再发 '0'~'5' 录入该手势；其它手势发 invalid，当前位重录。
+# 电机页：'1'/'2'/'3' 是一/二/三档。
+# '0' -> 电机页停止。
+# like -> 进入当前菜单项。
+# dislike -> 退出当前页面；如果已经在首页，则退出登录并回到锁屏。
+# palm/fist -> 舵机页开门/关门。
+#
+# 手势标签对应关系：
+# one/two_up/three/four -> 串口 '1'/'2'/'3'/'4'。
+# palm -> 串口 '5'；fist/grip -> 串口 '0'；其它手势 -> invalid。
+# like/dislike -> like/dislike。
+# palm/fist -> palm/fist。
 #
 # 例子：如果你想让 like 手势表示高速，就加一行："like": "3"。
 DEFAULT_GESTURE_COMMANDS = {
+    # STM32 串口命令速记：
+    # 锁屏：发送 1234 解锁，默认手势密码也是 1234，可在“手势录入”菜单修改。
+    # 首页：1/2/3/4 只选中 电机/舵机/读卡器/手势录入，ok/like 才进入。
+    # 手势录入页：先 ok/like 开始当前项倒计时，再发送 0~5 作为该位手势；其它手势发 invalid 重录当前位。
+    # 电机页：0=停止，1/2/3=一/二/三档。
+    # 舵机页：5/open=开，0/close=关；其中 palm=5，fist/grip=0。
+    # like=确认/进入/开始当前项，dislike=exit 退出。
+    # 手势标签：one/two_up/three/four 分别发送 '1'/'2'/'3'/'4'。
     "stop": "0",
     "stop_inverted": "0",
-    "palm": "palm",
-    "fist": "fist",
+    "palm": "5",
+    "fist": "0",
+    "grip": "0",
+    "ok": "ok",
     "like": "like",
     "dislike": "dislike",
-    "thumb_index": "switch",
-    "three_gun": "switch",
     "one": "1",
     "two_up": "2",
     "peace": "2",    
-    "peace": "2",  
     "peace_inverted": "2",
     "three": "3",
     "three2": "3",
     "three3": "3",
+    "four": "4",
 }
 
 class Stm32SerialController:
@@ -66,7 +81,7 @@ class Stm32SerialController:
         port,
         baudrate=115200,
         min_interval=1.0,
-        default_command="0",
+        default_command="invalid",
         gesture_commands=None,
         dry_run=False,
     ):
@@ -76,7 +91,7 @@ class Stm32SerialController:
         self.baudrate = baudrate
         # min_interval 是命令稳定时间，防止手势切换途中短暂误识别被发送。
         self.min_interval = max(0.0, min_interval)
-        # default_command 是默认命令。识别不到手势或手势没有配置时，默认发 '0' 停止电机。
+        # default_command 是默认命令。识别不到手势或手势没有配置时，默认发 invalid，不参与密码录入。
         self.default_command = default_command
         # gesture_commands 是手势到命令的映射表。这里复制一份，避免外部修改影响运行中的对象。
         self.gesture_commands = dict(gesture_commands or DEFAULT_GESTURE_COMMANDS)
@@ -117,7 +132,7 @@ class Stm32SerialController:
         """
         # 第一步：从当前帧的 detections 中选一个最可信的手势标签。
         label = self._select_label(detections, labels)
-        # 第二步：把手势标签查表转换成 STM32 命令。查不到就用 default_command，也就是停止。
+        # 第二步：把手势标签查表转换成 STM32 命令。查不到就用 default_command，也就是 invalid。
         command = self.gesture_commands.get(label, self.default_command)
         now = time.time()
 
@@ -138,14 +153,18 @@ class Stm32SerialController:
         """向 STM32 发送 1 个 ASCII 命令字符。
 
         注意：这里不是发送完整 JSON，也不是发送手势名字。
-        实际发送的是一个短 ASCII 命令，例如 b'0'、b'3' 或 b'switch'。
+        实际发送的是一个短 ASCII 命令，例如 b'0'、b'3' 或 b'invalid'。
         STM32 收到命令后，会结合当前 OLED 页面决定具体动作。
         """
         now = time.time()
 
-        # 同一个命令已经发过时，不再重复发送。
-        # 这样同一个手势一直在镜头前时，串口不会被重复命令刷屏。
-        if command == self._last_command:
+        # 同一个命令已经发过时，默认不重复发送。
+        # 但数字手势 0~5 用于密码输入，保持稳定时每隔 min_interval 再发一次，支持 5555 这种连续密码。
+        # invalid 也允许按 min_interval 重复发送，方便录入页持续判定当前位无效。
+        repeatable_command = command == "invalid" or command in "012345"
+        if command == self._last_command and not (
+            repeatable_command and now - self._last_send_time >= self.min_interval
+        ):
             return
 
         if self.dry_run:
@@ -169,7 +188,7 @@ class Stm32SerialController:
         但电机控制需要一个明确指令，所以这里选择 score 最大，也就是置信度最高的检测结果。
         """
         if not detections:
-            # 没识别到任何东西，返回 None；上层会使用 default_command 停止电机。
+            # 没识别到任何东西，返回 None；上层会使用 default_command，也就是 invalid。
             return None
 
         # max(..., key=...) 表示按 score 字段找出最高置信度的检测结果。

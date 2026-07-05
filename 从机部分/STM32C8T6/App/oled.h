@@ -32,7 +32,10 @@ typedef enum
 typedef enum
 {
   OLED_HOME_MOTOR = 0,
-  OLED_HOME_SERVO = 1
+  OLED_HOME_SERVO = 1,
+  OLED_HOME_RFID = 2,
+  OLED_HOME_GESTURE = 3,
+  OLED_HOME_COUNT = 4
 } OLED_HomeSelection;
 
 typedef enum
@@ -48,6 +51,14 @@ void OLED_Init(void);
 void OLED_Fill(uint16_t color);
 
 void OLED_PlayBootAnimation(void);
+void OLED_ShowLockPage(void);
+void OLED_ShowLockInputPage(const uint8_t *code, uint8_t length, uint8_t error);
+void OLED_ShowUnlockSuccessPage(void);
+void OLED_ShowUnlockDeniedPage(uint8_t retry_count);
+void OLED_ShowRfidEnrollPage(void);
+void OLED_ShowRfidEnrollSuccessPage(void);
+void OLED_ShowGestureEnrollPage(uint8_t step, uint8_t countdown, uint8_t recording, const uint8_t *code);
+void OLED_ShowModifySuccessPage(void);
 void OLED_ShowHomePage(OLED_HomeSelection selection);
 void OLED_AnimateHomeSelection(OLED_HomeSelection from, OLED_HomeSelection to);
 
