@@ -392,7 +392,12 @@ static void OLED_DrawLockIcon(uint16_t x, uint16_t y, uint16_t color, uint8_t op
 static void OLED_DrawRfidIcon(uint16_t x, uint16_t y, uint16_t color, uint8_t selected);
 static void OLED_DrawGestureIcon(uint16_t x, uint16_t y, uint16_t color, uint8_t selected);
 static void OLED_DrawDigitSmall(uint16_t x, uint16_t y, uint8_t digit, uint16_t color);
+static void OLED_DrawHomeMiniIcon(OLED_HomeSelection item, int16_t x, int16_t y, uint16_t color);
 static void OLED_DrawHomeFrame(OLED_HomeSelection selection, int8_t slide);
+static void OLED_DrawHomeItem(OLED_HomeSelection item, int16_t x, int16_t y, int16_t w, int16_t h, uint8_t selected);
+static void OLED_DrawHomeMenuFrame(OLED_HomeSelection selection, int16_t focus_y, int16_t focus_h);
+static void OLED_DrawHomeMotionBand(OLED_HomeSelection selection, int16_t old_y, int16_t old_h, int16_t new_y, int16_t new_h);
+static int16_t OLED_EaseOutQuad(int16_t from, int16_t to, uint8_t step, uint8_t steps);
 
 /* 发送 1 字节屏幕命令：拉低 CS，DC 置 0，通过 SPI1 发出命令码。 */
 static void OLED_WriteCommand(uint8_t command)
@@ -890,10 +895,10 @@ static void OLED_DrawGestureIcon(uint16_t x, uint16_t y, uint16_t color, uint8_t
 
 static void OLED_DrawDigitSmall(uint16_t x, uint16_t y, uint8_t digit, uint16_t color)
 {
-  static const uint8_t digit_segments[] = {0x3FU, 0x06U, 0x5BU, 0x4FU, 0x66U, 0x6DU};
+  static const uint8_t digit_segments[] = {0x3FU, 0x06U, 0x5BU, 0x4FU, 0x66U, 0x6DU, 0x7DU, 0x07U, 0x7FU, 0x6FU};
   uint8_t seg;
 
-  if (digit > 5U)
+  if (digit > 9U)
   {
     return;
   }
@@ -909,71 +914,169 @@ static void OLED_DrawDigitSmall(uint16_t x, uint16_t y, uint8_t digit, uint16_t 
   if ((seg & 0x40U) != 0U) { OLED_FillRect((uint16_t)(x + 3U), (uint16_t)(y + 9U), 8U, 2U, color); }
 }
 
-static void OLED_DrawHomeFrame(OLED_HomeSelection selection, int8_t slide)
+static int16_t OLED_EaseOutQuad(int16_t from, int16_t to, uint8_t step, uint8_t steps)
 {
-  static const OLED_Glyph16Index title[] = {GLYPH16_SHOU, GLYPH16_SHI, GLYPH16_JIA, GLYPH16_JU, GLYPH16_GUAN, GLYPH16_LI, GLYPH16_XI, GLYPH16_TONG};
+  int32_t delta;
+  int32_t numerator;
+  int32_t denominator;
+
+  if ((steps == 0U) || (step >= steps))
+  {
+    return to;
+  }
+
+  delta = (int32_t)to - (int32_t)from;
+  numerator = (int32_t)step * ((int32_t)(2U * steps) - (int32_t)step);
+  denominator = (int32_t)steps * (int32_t)steps;
+  return (int16_t)((int32_t)from + ((delta * numerator) / denominator));
+}
+
+static void OLED_DrawHomeMiniIcon(OLED_HomeSelection item, int16_t x, int16_t y, uint16_t color)
+{
+  if (item == OLED_HOME_MOTOR)
+  {
+    OLED_DrawFrame(x, y, 14, 14, color, 1U);
+    OLED_FillRectSigned((int16_t)(x + 6), (int16_t)(y + 2), 2, 10, color);
+    OLED_FillRectSigned((int16_t)(x + 2), (int16_t)(y + 6), 10, 2, color);
+    OLED_FillRectSigned((int16_t)(x + 5), (int16_t)(y + 5), 4, 4, OLED_COLOR_WHITE);
+  }
+  else if (item == OLED_HOME_SERVO)
+  {
+    OLED_DrawFrame(x, y, 13, 15, color, 1U);
+    OLED_FillRectSigned((int16_t)(x + 3), (int16_t)(y + 3), 7, 9, color);
+    OLED_FillRectSigned((int16_t)(x + 9), (int16_t)(y + 7), 2, 2, OLED_COLOR_WHITE);
+  }
+  else if (item == OLED_HOME_RFID)
+  {
+    OLED_DrawFrame(x, y, 14, 15, color, 1U);
+    OLED_FillRectSigned((int16_t)(x + 3), (int16_t)(y + 3), 8, 3, color);
+    OLED_FillRectSigned((int16_t)(x + 4), (int16_t)(y + 9), 6, 1, color);
+    OLED_FillRectSigned((int16_t)(x + 4), (int16_t)(y + 12), 6, 1, color);
+  }
+  else
+  {
+    OLED_DrawFrame(x, y, 15, 15, color, 1U);
+    OLED_FillRectSigned((int16_t)(x + 3), (int16_t)(y + 9), 9, 3, color);
+    OLED_FillRectSigned((int16_t)(x + 5), (int16_t)(y + 4), 2, 7, color);
+    OLED_FillRectSigned((int16_t)(x + 8), (int16_t)(y + 3), 2, 8, color);
+    OLED_FillRectSigned((int16_t)(x + 11), (int16_t)(y + 5), 2, 6, color);
+  }
+}
+
+static void OLED_DrawHomeItem(OLED_HomeSelection item, int16_t x, int16_t y, int16_t w, int16_t h, uint8_t selected)
+{
   static const OLED_Glyph16Index motor_label[] = {GLYPH16_DIAN, GLYPH16_JI};
   static const OLED_Glyph16Index servo_label[] = {GLYPH16_DUO, GLYPH16_JI};
   static const OLED_Glyph16Index rfid_label[] = {GLYPH16_DU, GLYPH16_KA, GLYPH16_QI};
   static const OLED_Glyph16Index gesture_label[] = {GLYPH16_SHOU, GLYPH16_SHI};
-  uint8_t slot;
-  uint8_t item;
-  uint8_t selected;
-  int16_t x;
-  int16_t y;
-  int16_t w;
-  int16_t h;
+  uint16_t icon_color;
+  uint16_t text_color;
+  uint16_t background;
+  uint16_t label_x;
 
-  OLED_FillRect(0U, 29U, OLED_WIDTH, 82U, OLED_COLOR_BLACK);
+  (void)w;
+  (void)h;
+
+  icon_color = (selected != 0U) ? OLED_COLOR_YELLOW : OLED_COLOR_CYAN;
+  text_color = (selected != 0U) ? OLED_COLOR_WHITE : OLED_COLOR_GRAY;
+  background = (selected != 0U) ? OLED_COLOR_CARD : OLED_COLOR_DARK;
+  label_x = (uint16_t)(x + 38);
+
+  OLED_DrawHomeMiniIcon(item, (int16_t)(x + 10), (int16_t)(y + 3), icon_color);
+
+  if (item == OLED_HOME_MOTOR)
+  {
+    OLED_DrawText16(label_x, (uint16_t)(y + 3), motor_label, 2U, text_color, background);
+  }
+  else if (item == OLED_HOME_SERVO)
+  {
+    OLED_DrawText16(label_x, (uint16_t)(y + 3), servo_label, 2U, text_color, background);
+  }
+  else if (item == OLED_HOME_RFID)
+  {
+    OLED_DrawText16(label_x, (uint16_t)(y + 3), rfid_label, 3U, text_color, background);
+  }
+  else
+  {
+    OLED_DrawText16(label_x, (uint16_t)(y + 3), gesture_label, 2U, text_color, background);
+  }
+}
+
+static void OLED_DrawHomeMenuFrame(OLED_HomeSelection selection, int16_t focus_y, int16_t focus_h)
+{
+  static const OLED_Glyph16Index title[] = {GLYPH16_SHOU, GLYPH16_SHI, GLYPH16_JIA, GLYPH16_JU, GLYPH16_GUAN, GLYPH16_LI, GLYPH16_XI, GLYPH16_TONG};
+  OLED_HomeSelection item;
+  uint8_t i;
+  int16_t y;
+  uint8_t selected;
+
+  OLED_FillRect(0U, 29U, OLED_WIDTH, 99U, OLED_COLOR_BLACK);
   OLED_DrawText16(0U, 4U, title, 8U, OLED_COLOR_YELLOW, OLED_COLOR_BLACK);
   OLED_FillRect(8U, 24U, 112U, 2U, OLED_COLOR_BLUE);
   OLED_FillRect(18U, 27U, 92U, 1U, OLED_COLOR_CYAN);
 
-  for (slot = 0U; slot < 2U; slot++)
+  for (i = 0U; i < (uint8_t)OLED_HOME_COUNT; i++)
   {
-    item = (uint8_t)selection + slot;
-    if (item >= (uint8_t)OLED_HOME_COUNT)
-    {
-      item = 0U;
-    }
+    item = (OLED_HomeSelection)i;
+    selected = (item == selection) ? 1U : 0U;
+    y = (int16_t)(35 + ((int16_t)i * 23));
 
-    selected = (slot == 0U) ? 1U : 0U;
-    x = (slot == 0U) ? (int16_t)(8 + slide) : (int16_t)(76 + slide);
-    y = selected ? 32 : 39;
-    w = selected ? 56 : 46;
-    h = selected ? 74 : 61;
+    OLED_FillRectSigned(9, y, 110, 21, selected ? OLED_COLOR_CARD : OLED_COLOR_DARK);
+    OLED_DrawHomeItem(item, 9, y, 110, 21, selected);
+  }
 
-    OLED_FillRectSigned(x, y, w, h, selected ? OLED_COLOR_CARD : OLED_COLOR_DARK);
-    OLED_DrawFrame(x, y, w, h, selected ? OLED_COLOR_YELLOW : OLED_COLOR_GRAY, selected ? 2U : 1U);
+  OLED_DrawFrame(6, focus_y, 116, focus_h, OLED_COLOR_YELLOW, 2U);
+  OLED_FillRectSigned(10, (int16_t)(focus_y + focus_h - 4), 108, 2, OLED_COLOR_CYAN);
+}
 
-    if (item == (uint8_t)OLED_HOME_MOTOR)
+static void OLED_DrawHomeMotionBand(OLED_HomeSelection selection, int16_t old_y, int16_t old_h, int16_t new_y, int16_t new_h)
+{
+  OLED_HomeSelection item;
+  uint8_t i;
+  int16_t y;
+  int16_t top;
+  int16_t bottom;
+  int16_t row_bottom;
+  uint8_t selected;
+
+  top = (old_y < new_y) ? old_y : new_y;
+  bottom = ((old_y + old_h) > (new_y + new_h)) ? (int16_t)(old_y + old_h) : (int16_t)(new_y + new_h);
+  top = (int16_t)(top - 4);
+  bottom = (int16_t)(bottom + 4);
+
+  if (top < 29)
+  {
+    top = 29;
+  }
+  if (bottom > 128)
+  {
+    bottom = 128;
+  }
+
+  OLED_FillRectSigned(4, top, 120, (int16_t)(bottom - top), OLED_COLOR_BLACK);
+
+  for (i = 0U; i < (uint8_t)OLED_HOME_COUNT; i++)
+  {
+    item = (OLED_HomeSelection)i;
+    selected = (item == selection) ? 1U : 0U;
+    y = (int16_t)(35 + ((int16_t)i * 23));
+    row_bottom = (int16_t)(y + 21);
+
+    if ((row_bottom >= top) && (y <= bottom))
     {
-      OLED_DrawFanIcon((uint16_t)(x + (w / 2)), (uint16_t)(y + 25), selected, selected ? OLED_COLOR_YELLOW : OLED_COLOR_CYAN);
-      OLED_DrawText16((uint16_t)(x + ((w - 32) / 2)), (uint16_t)(y + h - 22), motor_label, 2U, selected ? OLED_COLOR_WHITE : OLED_COLOR_GRAY, selected ? OLED_COLOR_CARD : OLED_COLOR_DARK);
-    }
-    else if (item == (uint8_t)OLED_HOME_SERVO)
-    {
-      OLED_DrawDoorIcon((uint16_t)(x + ((w - 24) / 2)), (uint16_t)(y + 12), 24U, 32U, selected, 0U);
-      OLED_DrawText16((uint16_t)(x + ((w - 32) / 2)), (uint16_t)(y + h - 22), servo_label, 2U, selected ? OLED_COLOR_WHITE : OLED_COLOR_GRAY, selected ? OLED_COLOR_CARD : OLED_COLOR_DARK);
-    }
-    else if (item == (uint8_t)OLED_HOME_RFID)
-    {
-      OLED_DrawRfidIcon((uint16_t)(x + ((w - 24) / 2)), (uint16_t)(y + 10), selected ? OLED_COLOR_YELLOW : OLED_COLOR_CYAN, selected);
-      if (selected != 0U)
-      {
-        OLED_DrawText16((uint16_t)(x + 4), (uint16_t)(y + h - 22), rfid_label, 3U, OLED_COLOR_WHITE, OLED_COLOR_CARD);
-      }
-      else
-      {
-        OLED_DrawText16((uint16_t)(x + 7), (uint16_t)(y + h - 22), rfid_label, 2U, OLED_COLOR_GRAY, OLED_COLOR_DARK);
-      }
-    }
-    else
-    {
-      OLED_DrawGestureIcon((uint16_t)(x + ((w - 28) / 2)), (uint16_t)(y + 13), selected ? OLED_COLOR_YELLOW : OLED_COLOR_CYAN, selected);
-      OLED_DrawText16((uint16_t)(x + ((w - 32) / 2)), (uint16_t)(y + h - 22), gesture_label, 2U, selected ? OLED_COLOR_WHITE : OLED_COLOR_GRAY, selected ? OLED_COLOR_CARD : OLED_COLOR_DARK);
+      OLED_FillRectSigned(9, y, 110, 21, selected ? OLED_COLOR_CARD : OLED_COLOR_DARK);
+      OLED_DrawHomeItem(item, 9, y, 110, 21, selected);
     }
   }
+
+  OLED_DrawFrame(6, new_y, 116, new_h, OLED_COLOR_YELLOW, 2U);
+  OLED_FillRectSigned(10, (int16_t)(new_y + new_h - 4), 108, 2, OLED_COLOR_CYAN);
+}
+
+static void OLED_DrawHomeFrame(OLED_HomeSelection selection, int8_t slide)
+{
+  (void)slide;
+  OLED_DrawHomeMenuFrame(selection, (int16_t)(33 + ((int16_t)selection * 23)), 25);
 }
 
 void OLED_PlayBootAnimation(void)
@@ -1041,6 +1144,42 @@ void OLED_ShowLockInputPage(const uint8_t *code, uint8_t length, uint8_t error)
   {
     OLED_FillRect(24U, 121U, 80U, 1U, OLED_COLOR_GRAY);
   }
+}
+
+void OLED_ShowAuthLockPage(uint8_t remaining_seconds)
+{
+  static const OLED_Glyph16Index title_top[] = {GLYPH16_SHOU, GLYPH16_SHI, GLYPH16_JIA, GLYPH16_JU};
+  static const OLED_GlyphIndex lock_text[] = {GLYPH_TING, GLYPH_ZHI};
+  uint8_t tens;
+  uint8_t ones;
+  uint16_t bar_width;
+
+  if (remaining_seconds > 30U)
+  {
+    remaining_seconds = 30U;
+  }
+
+  tens = (uint8_t)(remaining_seconds / 10U);
+  ones = (uint8_t)(remaining_seconds % 10U);
+  bar_width = (uint16_t)(((uint16_t)remaining_seconds * 84U) / 30U);
+
+  OLED_Fill(OLED_COLOR_BLACK);
+  OLED_DrawText16(32U, 6U, title_top, 4U, OLED_COLOR_RED, OLED_COLOR_BLACK);
+  OLED_FillRect(14U, 30U, 100U, 2U, OLED_COLOR_RED);
+  OLED_DrawLockIcon(37U, 34U, OLED_COLOR_RED, 0U);
+  OLED_DrawGlyph24(40U, 78U, lock_text[0], OLED_COLOR_ORANGE, OLED_COLOR_BLACK);
+  OLED_DrawGlyph24(64U, 78U, lock_text[1], OLED_COLOR_ORANGE, OLED_COLOR_BLACK);
+
+  OLED_DrawDigitSmall(43U, 101U, tens, OLED_COLOR_YELLOW);
+  OLED_DrawDigitSmall(61U, 101U, ones, OLED_COLOR_YELLOW);
+  OLED_FillRect(83U, 104U, 8U, 2U, OLED_COLOR_YELLOW);
+  OLED_FillRect(83U, 112U, 8U, 2U, OLED_COLOR_YELLOW);
+  OLED_FillRect(83U, 120U, 8U, 2U, OLED_COLOR_YELLOW);
+  OLED_FillRect(81U, 106U, 2U, 6U, OLED_COLOR_YELLOW);
+  OLED_FillRect(91U, 114U, 2U, 6U, OLED_COLOR_YELLOW);
+
+  OLED_FillRect(22U, 124U, 84U, 4U, OLED_COLOR_DARK);
+  OLED_FillRect(22U, 124U, bar_width, 4U, OLED_COLOR_RED);
 }
 
 void OLED_ShowUnlockSuccessPage(void)
@@ -1172,9 +1311,20 @@ void OLED_ShowHomePage(OLED_HomeSelection selection)
 
 void OLED_AnimateHomeSelection(OLED_HomeSelection from, OLED_HomeSelection to)
 {
-  int8_t direction;
-  int8_t slide;
+  int16_t from_y;
+  int16_t to_y;
+  int16_t old_y;
+  int16_t old_h;
+  int16_t focus_y;
+  int16_t focus_h;
+  uint8_t focus_index;
   uint8_t step;
+  const uint8_t steps = 18U;
+
+  if (((uint8_t)from >= (uint8_t)OLED_HOME_COUNT) || ((uint8_t)to >= (uint8_t)OLED_HOME_COUNT))
+  {
+    return;
+  }
 
   if (from == to)
   {
@@ -1182,23 +1332,27 @@ void OLED_AnimateHomeSelection(OLED_HomeSelection from, OLED_HomeSelection to)
     return;
   }
 
-  direction = (to == OLED_HOME_SERVO) ? -1 : 1;
+  from_y = (int16_t)(33 + ((int16_t)from * 23));
+  to_y = (int16_t)(33 + ((int16_t)to * 23));
+  old_y = from_y;
+  old_h = 25;
 
-  for (step = 0U; step <= 3U; step++)
+  for (step = 1U; step <= steps; step++)
   {
-    slide = (int8_t)(direction * (int8_t)(step * 2U));
-    OLED_DrawHomeFrame(from, slide);
-    HAL_Delay(16U);
+    focus_y = OLED_EaseOutQuad(from_y, to_y, step, steps);
+    focus_h = OLED_EaseOutQuad(23, 25, step, steps);
+    focus_index = (uint8_t)((focus_y - 33 + 11) / 23);
+    if (focus_index >= (uint8_t)OLED_HOME_COUNT)
+    {
+      focus_index = (uint8_t)to;
+    }
+    OLED_DrawHomeMotionBand((OLED_HomeSelection)focus_index, old_y, old_h, focus_y, focus_h);
+    old_y = focus_y;
+    old_h = focus_h;
+    HAL_Delay(6U);
   }
 
-  for (step = 3U; step > 0U; step--)
-  {
-    slide = (int8_t)((-direction) * (int8_t)(step * 2U));
-    OLED_DrawHomeFrame(to, slide);
-    HAL_Delay(16U);
-  }
-
-  OLED_DrawHomeFrame(to, 0);
+  OLED_DrawHomeMotionBand(to, old_y, old_h, to_y, 25);
 }
 
 /*
@@ -1267,7 +1421,7 @@ void OLED_UpdateMotorState(OLED_MotorState state)
   }
 
   /* 先擦除旧状态，再绘制新状态，避免档位文字叠在一起。 */
-  OLED_FillRect(0U, 96U, OLED_WIDTH, 32U, OLED_COLOR_BLACK);
+  OLED_FillRect(36U, 96U, 60U, 32U, OLED_COLOR_BLACK);
   OLED_DrawGlyph24(40U, 98U, first, color, OLED_COLOR_BLACK);
   OLED_DrawGlyph24(64U, 98U, second, color, OLED_COLOR_BLACK);
 }

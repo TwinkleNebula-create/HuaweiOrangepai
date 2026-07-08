@@ -186,6 +186,36 @@ uint8_t RFID_IsUnlocked(void)
   return rfid_unlocked;
 }
 
+void RFID_SetStoredCard(const uint8_t card_id[RFID_CARD_ID_LENGTH])
+{
+  uint8_t i;
+
+  __disable_irq();
+  for (i = 0U; i < RFID_CARD_ID_LENGTH; i++)
+  {
+    rfid_card[i] = card_id[i];
+  }
+  rfid_card_saved = 1U;
+  rfid_retry_count = 0U;
+  __enable_irq();
+}
+
+uint8_t RFID_GetStoredCard(uint8_t card_id[RFID_CARD_ID_LENGTH])
+{
+  uint8_t i;
+  uint8_t saved;
+
+  __disable_irq();
+  saved = rfid_card_saved;
+  for (i = 0U; i < RFID_CARD_ID_LENGTH; i++)
+  {
+    card_id[i] = rfid_card[i];
+  }
+  __enable_irq();
+
+  return saved;
+}
+
 void RFID_StartEnroll(void)
 {
   rfid_enroll_mode = 1U;

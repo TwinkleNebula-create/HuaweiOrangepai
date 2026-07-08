@@ -21,5 +21,7 @@ void RFID_StartEnroll(void);
 uint8_t RFID_HasCard(void);
 uint8_t RFID_IsUnlocked(void);
 void RFID_Lock(void);
+void RFID_SetStoredCard(const uint8_t card_id[RFID_CARD_ID_LENGTH]);
+uint8_t RFID_GetStoredCard(uint8_t card_id[RFID_CARD_ID_LENGTH]);
 
 #endif /* __RFID_READER_H__ */

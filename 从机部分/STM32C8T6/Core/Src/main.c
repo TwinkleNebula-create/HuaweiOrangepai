@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
 #include "spi.h"
 #include "tim.h"
 #include "usart.h"
@@ -28,6 +29,7 @@
 /* OLED 应用层接口：底层驱动在 App/oled.c，主程序只负责初始化和状态刷新。 */
 #include "oled.h"
 #include "rfid_reader.h"
+#include "at24c02.h"
 
 /* USER CODE END Includes */
 
@@ -38,9 +40,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define SERVO_CLOSED_PULSE  1000U
-#define SERVO_OPEN_PULSE    2000U
-#define SERVO_OLED_SETTLE_MS  300U
+#define SERVO_CLOSED_PULSE  500U
+#define SERVO_OPEN_PULSE    2500U
+#define MOTOR_PWM_OLED_GUARD_MS   100U
 #define APP_UNLOCK_MESSAGE_MS  900U
 #define APP_UNLOCK_CODE_LENGTH  4U
 #define APP_MESSAGE_NONE        0U
@@ -49,8 +51,16 @@
 #define APP_MESSAGE_ENROLL_OK   3U
 #define APP_MESSAGE_MODIFY_OK   4U
 #define APP_LOCK_ERROR_MS       1000U
+#define APP_AUTH_MAX_RETRY      3U
+#define APP_AUTH_LOCK_MS        30000U
 #define APP_GESTURE_ENROLL_COUNTDOWN_MAX  3U
 #define APP_GESTURE_ENROLL_STEP_MS        1000U
+#define APP_STORAGE_ADDR                  0U
+#define APP_STORAGE_MAGIC0                0x48U
+#define APP_STORAGE_MAGIC1                0x47U
+#define APP_STORAGE_VERSION               1U
+#define APP_STORAGE_FLAG_RFID             0x01U
+#define APP_STORAGE_FLAG_GESTURE          0x02U
 
 /* USER CODE END PD */
 
@@ -75,6 +85,17 @@ typedef enum
   APP_PAGE_GESTURE_ENROLL = 5
 } AppPage;
 
+typedef struct
+{
+  uint8_t magic0;
+  uint8_t magic1;
+  uint8_t version;
+  uint8_t flags;
+  uint8_t rfid_card[RFID_CARD_ID_LENGTH];
+  uint8_t gesture_code[APP_UNLOCK_CODE_LENGTH];
+  uint8_t checksum;
+} AppStorageData;
+
 /*
  * OLED 刷新状态缓存。
  * motor_display_state 保存当前应该显示的电机状态；motor_display_pending 表示主循环需要刷新屏幕。
@@ -82,6 +103,14 @@ typedef enum
  */
 static volatile uint8_t motor_display_state = (uint8_t)OLED_MOTOR_STOP;
 static volatile uint8_t motor_display_pending = 0U;
+static volatile uint16_t motor_pwm_target = 0U;
+static volatile uint16_t motor_pwm_active = 0U;
+static volatile uint8_t motor_pwm_pending = 0U;
+static volatile uint32_t motor_pwm_due_tick = 0U;
+static volatile uint8_t motor_oled_guard_active = 0U;
+static volatile uint8_t motor_oled_guard_waiting_refresh = 0U;
+static volatile uint32_t motor_oled_guard_due_tick = 0U;
+static volatile uint8_t motor_stop_after_refresh = 0U;
 static volatile uint8_t app_page = (uint8_t)APP_PAGE_HOME;
 static volatile uint8_t home_selection = (uint8_t)OLED_HOME_MOTOR;
 static volatile uint8_t home_selection_old = (uint8_t)OLED_HOME_MOTOR;
@@ -96,6 +125,15 @@ static volatile uint8_t unlock_code_index = 0U;
 static uint8_t unlock_input_code[APP_UNLOCK_CODE_LENGTH];
 static volatile uint8_t lock_error_pending = 0U;
 static volatile uint32_t lock_error_due_tick = 0U;
+static volatile uint8_t password_retry_count = 0U;
+static volatile uint8_t password_lock_active = 0U;
+static volatile uint32_t password_lock_due_tick = 0U;
+static volatile uint8_t rfid_auth_retry_count = 0U;
+static volatile uint8_t rfid_lock_active = 0U;
+static volatile uint32_t rfid_lock_due_tick = 0U;
+static volatile uint8_t auth_lock_page_active = 0U;
+static volatile uint8_t auth_lock_display_seconds = 0U;
+static volatile uint8_t auth_lock_display_pending = 0U;
 static volatile uint8_t access_message_pending = 0U;
 static volatile uint8_t access_message_mode = APP_MESSAGE_NONE;
 static volatile uint32_t access_message_due_tick = 0U;
@@ -103,6 +141,7 @@ static char uart_cmd_buffer[8];
 static uint8_t uart_cmd_len = 0U;
 static uint8_t unlock_code[APP_UNLOCK_CODE_LENGTH] = {'1', '2', '3', '4'};
 static uint8_t gesture_enroll_code[APP_UNLOCK_CODE_LENGTH];
+static volatile uint8_t credential_save_pending = 0U;
 static volatile uint8_t gesture_enroll_index = 0U;
 static volatile uint8_t gesture_enroll_recording = 0U;
 static volatile uint8_t gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
@@ -129,12 +168,18 @@ static void App_OpenHomeItem(uint8_t item);
 static void App_SelectHomeItem(uint8_t item);
 static void App_HandleUnlockByte(uint8_t byte);
 static void App_HandleLockErrorTimer(void);
+static void App_HandleAuthLockoutTimer(void);
+static void App_StartAuthLockout(uint8_t rfid_source);
 static void App_StartGestureEnroll(void);
 static void App_StartGestureEnrollStep(void);
 static void App_HandleGestureEnrollByte(uint8_t byte);
 static void App_HandleGestureInvalid(void);
 static void App_HandleGestureEnrollTimer(void);
 static void App_HandleRfidEvents(void);
+static uint8_t App_StorageChecksum(const AppStorageData *storage);
+static void App_LoadCredentials(void);
+static void App_RequestCredentialSave(void);
+static void App_HandleCredentialSave(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -143,7 +188,9 @@ static void App_HandleRfidEvents(void);
 /**
  * @brief  设置电机 PWM 占空比，并同步记录 OLED 需要显示的档位。
  * @param  speed PWM 比较值，当前约定为 0、300、600、999 四档。
- * @note   这个函数会被串口接收中断调用，所以这里只改 PWM 和置刷新标志，不直接进行 SPI 刷屏。
+ * @note   这个函数会被串口接收中断调用，所以这里只记录目标档位并启动保护流程，
+ *         不直接进行 SPI 刷屏。主循环会先关闭 PWM，等 100ms，再刷 OLED，
+ *         最后再等 100ms 恢复目标 PWM。
  */
 void Motor_SetSpeed(uint16_t speed)
 {
@@ -154,9 +201,6 @@ void Motor_SetSpeed(uint16_t speed)
   {
     speed = 999U;
   }
-
-  /* 修改 TIM2_CH1 的比较值，实际改变电机 PWM 输出占空比。 */
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, speed);
 
   /* 将 PWM 数值映射成 OLED 页面上的状态：0=停止，300=一档，600=二档，999=三档。 */
   if (speed == 0U)
@@ -177,10 +221,24 @@ void Motor_SetSpeed(uint16_t speed)
   }
 
   /*
-   * 只记录状态并置位刷新请求。
-   * 真正的 OLED_UpdateMotorState() 放在 while(1) 中执行，避免在 UART 中断里长时间阻塞 SPI。
+   * 先记录目标 PWM 和目标显示状态。
+   * while(1) 会先把 TIM2_CH1 占空比临时清零，等 OLED 供电/总线稳定后再刷屏，
+   * 刷屏结束后再延迟恢复目标 PWM。
    */
-  motor_display_state = state;
+  motor_pwm_target = speed;
+  motor_pwm_pending = 0U;
+  motor_pwm_due_tick = 0U;
+  motor_stop_after_refresh = (speed == 0U) ? 1U : 0U;
+  motor_oled_guard_active = 1U;
+  motor_oled_guard_waiting_refresh = 1U;
+  motor_oled_guard_due_tick = HAL_GetTick() + MOTOR_PWM_OLED_GUARD_MS;
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0U);
+  motor_pwm_active = 0U;
+
+  if (motor_display_state != state)
+  {
+    motor_display_state = state;
+  }
   motor_display_pending = 1U;
 }
 
@@ -210,8 +268,94 @@ static void Servo_SetDoor(uint8_t open)
 {
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (open != 0U) ? SERVO_OPEN_PULSE : SERVO_CLOSED_PULSE);
   servo_door_state = (open != 0U) ? (uint8_t)OLED_DOOR_OPEN : (uint8_t)OLED_DOOR_CLOSED;
-  servo_display_due_tick = HAL_GetTick() + SERVO_OLED_SETTLE_MS;
+  servo_display_due_tick = HAL_GetTick();
   servo_display_pending = 1U;
+}
+
+static uint8_t App_StorageChecksum(const AppStorageData *storage)
+{
+  const uint8_t *bytes;
+  uint8_t sum;
+  uint8_t i;
+
+  bytes = (const uint8_t *)storage;
+  sum = 0U;
+  for (i = 0U; i < (uint8_t)(sizeof(AppStorageData) - 1U); i++)
+  {
+    sum = (uint8_t)(sum + bytes[i]);
+  }
+
+  return (uint8_t)(0xA5U ^ sum);
+}
+
+static void App_LoadCredentials(void)
+{
+  AppStorageData storage;
+  uint8_t i;
+
+  if (AT24C02_Read(APP_STORAGE_ADDR, (uint8_t *)&storage, (uint16_t)sizeof(storage)) != HAL_OK)
+  {
+    return;
+  }
+
+  if ((storage.magic0 != APP_STORAGE_MAGIC0) ||
+      (storage.magic1 != APP_STORAGE_MAGIC1) ||
+      (storage.version != APP_STORAGE_VERSION) ||
+      (storage.checksum != App_StorageChecksum(&storage)))
+  {
+    return;
+  }
+
+  if ((storage.flags & APP_STORAGE_FLAG_RFID) != 0U)
+  {
+    RFID_SetStoredCard(storage.rfid_card);
+  }
+
+  if ((storage.flags & APP_STORAGE_FLAG_GESTURE) != 0U)
+  {
+    for (i = 0U; i < APP_UNLOCK_CODE_LENGTH; i++)
+    {
+      unlock_code[i] = storage.gesture_code[i];
+    }
+  }
+}
+
+static void App_RequestCredentialSave(void)
+{
+  credential_save_pending = 1U;
+}
+
+static void App_HandleCredentialSave(void)
+{
+  AppStorageData storage;
+  uint8_t i;
+
+  if (credential_save_pending == 0U)
+  {
+    return;
+  }
+
+  credential_save_pending = 0U;
+  storage.magic0 = APP_STORAGE_MAGIC0;
+  storage.magic1 = APP_STORAGE_MAGIC1;
+  storage.version = APP_STORAGE_VERSION;
+  storage.flags = APP_STORAGE_FLAG_GESTURE;
+
+  if (RFID_GetStoredCard(storage.rfid_card) != 0U)
+  {
+    storage.flags = (uint8_t)(storage.flags | APP_STORAGE_FLAG_RFID);
+  }
+
+  for (i = 0U; i < APP_UNLOCK_CODE_LENGTH; i++)
+  {
+    storage.gesture_code[i] = unlock_code[i];
+  }
+
+  storage.checksum = App_StorageChecksum(&storage);
+  if (AT24C02_Write(APP_STORAGE_ADDR, (const uint8_t *)&storage, (uint16_t)sizeof(storage)) != HAL_OK)
+  {
+    credential_save_pending = 1U;
+  }
 }
 
 static uint8_t App_StringEquals(const char *a, const char *b)
@@ -410,6 +554,15 @@ static void UART2_StartReceive(void)
 static void App_EnterHomeAfterUnlock(void)
 {
   access_unlocked = 1U;
+  password_retry_count = 0U;
+  password_lock_active = 0U;
+  password_lock_due_tick = 0U;
+  rfid_auth_retry_count = 0U;
+  rfid_lock_active = 0U;
+  rfid_lock_due_tick = 0U;
+  auth_lock_page_active = 0U;
+  auth_lock_display_seconds = 0U;
+  auth_lock_display_pending = 0U;
   app_page = (uint8_t)APP_PAGE_HOME;
   home_selection = (uint8_t)OLED_HOME_MOTOR;
   home_selection_old = (uint8_t)OLED_HOME_MOTOR;
@@ -426,8 +579,7 @@ static void App_ReturnHome(void)
   gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
   gesture_enroll_due_tick = 0U;
   app_page = (uint8_t)APP_PAGE_HOME;
-  home_selection = (uint8_t)OLED_HOME_MOTOR;
-  home_selection_old = (uint8_t)OLED_HOME_MOTOR;
+  home_selection_old = home_selection;
   home_transition_pending = 0U;
   page_redraw_pending = 1U;
 }
@@ -442,6 +594,15 @@ static void App_LockAndShow(void)
   unlock_code_index = 0U;
   lock_error_pending = 0U;
   lock_error_due_tick = 0U;
+  password_retry_count = 0U;
+  password_lock_active = 0U;
+  password_lock_due_tick = 0U;
+  rfid_auth_retry_count = 0U;
+  rfid_lock_active = 0U;
+  rfid_lock_due_tick = 0U;
+  auth_lock_page_active = 0U;
+  auth_lock_display_seconds = 0U;
+  auth_lock_display_pending = 0U;
   gesture_enroll_index = 0U;
   gesture_enroll_recording = 0U;
   gesture_enroll_countdown = APP_GESTURE_ENROLL_COUNTDOWN_MAX;
@@ -460,7 +621,7 @@ static void App_HandleUnlockByte(uint8_t byte)
   uint8_t i;
   uint8_t matched;
 
-  if (lock_error_pending != 0U)
+  if ((lock_error_pending != 0U) || (password_lock_active != 0U))
   {
     return;
   }
@@ -492,14 +653,29 @@ static void App_HandleUnlockByte(uint8_t byte)
     unlock_code_index = 0U;
     if (matched != 0U)
     {
+      password_retry_count = 0U;
+      password_lock_active = 0U;
+      password_lock_due_tick = 0U;
       access_unlocked = 1U;
       access_unlock_pending = 1U;
     }
     else
     {
-      lock_error_pending = 1U;
-      lock_error_due_tick = HAL_GetTick() + APP_LOCK_ERROR_MS;
-      OLED_ShowLockInputPage(unlock_input_code, APP_UNLOCK_CODE_LENGTH, 1U);
+      if (password_retry_count < APP_AUTH_MAX_RETRY)
+      {
+        password_retry_count++;
+      }
+
+      if (password_retry_count >= APP_AUTH_MAX_RETRY)
+      {
+        App_StartAuthLockout(0U);
+      }
+      else
+      {
+        lock_error_pending = 1U;
+        lock_error_due_tick = HAL_GetTick() + APP_LOCK_ERROR_MS;
+        OLED_ShowLockInputPage(unlock_input_code, APP_UNLOCK_CODE_LENGTH, 1U);
+      }
     }
   }
 }
@@ -510,8 +686,86 @@ static void App_HandleLockErrorTimer(void)
   {
     lock_error_pending = 0U;
     unlock_code_index = 0U;
-    OLED_ShowLockInputPage(unlock_input_code, 0U, 0U);
+    if ((password_lock_active == 0U) && (rfid_lock_active == 0U))
+    {
+      OLED_ShowLockInputPage(unlock_input_code, 0U, 0U);
+    }
   }
+}
+
+static void App_HandleAuthLockoutTimer(void)
+{
+  uint32_t now;
+  uint32_t due_tick;
+  uint32_t remain_ms;
+  uint8_t remaining_seconds;
+
+  now = HAL_GetTick();
+  if ((password_lock_active != 0U) && ((int32_t)(now - password_lock_due_tick) >= 0))
+  {
+    password_lock_active = 0U;
+    password_retry_count = 0U;
+    password_lock_due_tick = 0U;
+    unlock_code_index = 0U;
+    auth_lock_page_active = 0U;
+    auth_lock_display_seconds = 0U;
+    auth_lock_display_pending = 1U;
+  }
+
+  if ((rfid_lock_active != 0U) && ((int32_t)(now - rfid_lock_due_tick) >= 0))
+  {
+    rfid_lock_active = 0U;
+    rfid_auth_retry_count = 0U;
+    rfid_lock_due_tick = 0U;
+    RFID_Lock();
+    auth_lock_page_active = 0U;
+    auth_lock_display_seconds = 0U;
+    auth_lock_display_pending = 1U;
+  }
+
+  if ((password_lock_active != 0U) || (rfid_lock_active != 0U))
+  {
+    due_tick = (password_lock_active != 0U) ? password_lock_due_tick : rfid_lock_due_tick;
+    remain_ms = ((int32_t)(due_tick - now) > 0) ? (uint32_t)(due_tick - now) : 0U;
+    remaining_seconds = (uint8_t)((remain_ms + 999U) / 1000U);
+    if (remaining_seconds > 30U)
+    {
+      remaining_seconds = 30U;
+    }
+
+    if ((auth_lock_page_active == 0U) || (auth_lock_display_seconds != remaining_seconds))
+    {
+      auth_lock_page_active = 1U;
+      auth_lock_display_seconds = remaining_seconds;
+      auth_lock_display_pending = 1U;
+    }
+  }
+}
+
+static void App_StartAuthLockout(uint8_t rfid_source)
+{
+  uint32_t due_tick;
+
+  due_tick = HAL_GetTick() + APP_AUTH_LOCK_MS;
+  if (rfid_source != 0U)
+  {
+    rfid_lock_active = 1U;
+    rfid_lock_due_tick = due_tick;
+    RFID_Lock();
+  }
+  else
+  {
+    password_lock_active = 1U;
+    password_lock_due_tick = due_tick;
+  }
+
+  lock_error_pending = 0U;
+  unlock_code_index = 0U;
+  access_message_pending = 0U;
+  access_message_mode = APP_MESSAGE_NONE;
+  auth_lock_page_active = 1U;
+  auth_lock_display_seconds = 30U;
+  auth_lock_display_pending = 1U;
 }
 
 static void App_OpenHomeItem(uint8_t item)
@@ -546,10 +800,15 @@ static void App_SelectHomeItem(uint8_t item)
     return;
   }
 
+  if (item == home_selection)
+  {
+    return;
+  }
+
+  home_selection_old = home_selection;
   home_selection = item;
-  home_selection_old = item;
-  home_transition_pending = 0U;
-  page_redraw_pending = 1U;
+  home_transition_pending = 1U;
+  page_redraw_pending = 0U;
 }
 
 static void App_StartGestureEnroll(void)
@@ -598,6 +857,7 @@ static void App_HandleGestureEnrollByte(uint8_t byte)
     {
       unlock_code[i] = gesture_enroll_code[i];
     }
+    App_RequestCredentialSave();
     unlock_code_index = 0U;
     access_message_pending = 1U;
     access_message_mode = APP_MESSAGE_MODIFY_OK;
@@ -669,10 +929,22 @@ static void App_HandleRfidEvents(void)
   }
 
   event = RFID_PollEvent(card_id, &retry_count);
+  if (rfid_lock_active != 0U)
+  {
+    if (event != RFID_EVENT_NONE)
+    {
+      RFID_Lock();
+    }
+    event = RFID_EVENT_NONE;
+  }
+
   if (event == RFID_EVENT_AUTHORIZED)
   {
     if (access_unlocked == 0U)
     {
+      rfid_auth_retry_count = 0U;
+      rfid_lock_active = 0U;
+      rfid_lock_due_tick = 0U;
       access_unlocked = 1U;
       access_message_pending = 1U;
       access_message_mode = APP_MESSAGE_UNLOCK_OK;
@@ -684,14 +956,23 @@ static void App_HandleRfidEvents(void)
   {
     if (access_unlocked == 0U)
     {
-      access_message_pending = 1U;
-      access_message_mode = APP_MESSAGE_LOCK_FAIL;
-      access_message_due_tick = HAL_GetTick() + APP_UNLOCK_MESSAGE_MS;
-      OLED_ShowUnlockDeniedPage(retry_count);
+      rfid_auth_retry_count = retry_count;
+      if (rfid_auth_retry_count >= APP_AUTH_MAX_RETRY)
+      {
+        App_StartAuthLockout(1U);
+      }
+      else
+      {
+        access_message_pending = 1U;
+        access_message_mode = APP_MESSAGE_LOCK_FAIL;
+        access_message_due_tick = HAL_GetTick() + APP_UNLOCK_MESSAGE_MS;
+        OLED_ShowUnlockDeniedPage(retry_count);
+      }
     }
   }
   else if (event == RFID_EVENT_ENROLLED)
   {
+    App_RequestCredentialSave();
     access_message_pending = 1U;
     access_message_mode = APP_MESSAGE_ENROLL_OK;
     access_message_due_tick = HAL_GetTick() + APP_UNLOCK_MESSAGE_MS;
@@ -782,9 +1063,11 @@ int main(void)
   MX_SPI1_Init();
   MX_TIM4_Init();
   MX_USART2_UART_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
   RFID_Init();
+  App_LoadCredentials();
 
   /* 启动 TIM2_CH1 PWM 输出 */
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
@@ -824,15 +1107,59 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    uint8_t motor_update_due;
+    uint8_t motor_pwm_due;
+    uint8_t motor_guard_refresh_due;
+    uint8_t motor_guard_blocking_redraw;
     uint8_t servo_update_due;
+    uint8_t lock_display_pending;
+    uint8_t lock_display_seconds;
 
+    App_HandleAuthLockoutTimer();
     App_HandleRfidEvents();
     App_HandleLockErrorTimer();
     App_HandleGestureEnrollTimer();
+    App_HandleCredentialSave();
 
+    __disable_irq();
+    lock_display_pending = auth_lock_display_pending;
+    lock_display_seconds = auth_lock_display_seconds;
+    auth_lock_display_pending = 0U;
+    __enable_irq();
+
+    if (lock_display_pending != 0U)
+    {
+      if (lock_display_seconds == 0U)
+      {
+        OLED_ShowLockPage();
+      }
+      else
+      {
+        OLED_ShowAuthLockPage(lock_display_seconds);
+      }
+    }
+
+    motor_guard_refresh_due = ((motor_oled_guard_waiting_refresh != 0U) && ((int32_t)(HAL_GetTick() - motor_oled_guard_due_tick) >= 0)) ? 1U : 0U;
+    motor_guard_blocking_redraw = ((motor_oled_guard_active != 0U) && (motor_oled_guard_waiting_refresh != 0U) && (motor_guard_refresh_due == 0U)) ? 1U : 0U;
+    motor_update_due = ((motor_display_pending != 0U) && ((motor_oled_guard_active == 0U) || (motor_guard_refresh_due != 0U))) ? 1U : 0U;
+    motor_pwm_due = ((motor_pwm_pending != 0U) && ((int32_t)(HAL_GetTick() - motor_pwm_due_tick) >= 0)) ? 1U : 0U;
     servo_update_due = ((servo_display_pending != 0U) && ((int32_t)(HAL_GetTick() - servo_display_due_tick) >= 0)) ? 1U : 0U;
 
-    if ((home_transition_pending != 0U) || (page_redraw_pending != 0U) || (motor_display_pending != 0U) || (servo_update_due != 0U))
+    if (motor_pwm_due != 0U)
+    {
+      uint16_t pwm_target;
+
+      __disable_irq();
+      pwm_target = motor_pwm_target;
+      motor_pwm_pending = 0U;
+      motor_pwm_due_tick = 0U;
+      __enable_irq();
+
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pwm_target);
+      motor_pwm_active = pwm_target;
+    }
+
+    if ((motor_guard_blocking_redraw == 0U) && ((home_transition_pending != 0U) || (page_redraw_pending != 0U) || (motor_update_due != 0U) || (servo_update_due != 0U)))
     {
       uint8_t page;
       uint8_t selection;
@@ -856,11 +1183,15 @@ int main(void)
       door_state = servo_door_state;
       transition_pending = home_transition_pending;
       redraw_pending = page_redraw_pending;
-      motor_pending = motor_display_pending;
-      servo_pending = servo_update_due;
+        motor_pending = motor_update_due;
+        servo_pending = servo_update_due;
       home_transition_pending = 0U;
       page_redraw_pending = 0U;
-      motor_display_pending = 0U;
+      if (motor_pending != 0U)
+      {
+        motor_display_pending = 0U;
+        motor_oled_guard_waiting_refresh = 0U;
+      }
       if (servo_pending != 0U)
       {
         servo_display_pending = 0U;
@@ -870,11 +1201,33 @@ int main(void)
       /* 根据最新 PWM 档位刷新底部状态显示：停止/一档/二档/三档。 */
       if (transition_pending != 0U)
       {
+        if (motor_oled_guard_active == 0U)
+        {
+          motor_pwm_target = motor_pwm_active;
+          motor_pwm_pending = 0U;
+          motor_pwm_due_tick = 0U;
+          motor_oled_guard_active = 1U;
+          motor_oled_guard_waiting_refresh = 0U;
+          __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0U);
+          motor_pwm_active = 0U;
+          HAL_Delay(MOTOR_PWM_OLED_GUARD_MS);
+        }
         OLED_AnimateHomeSelection((OLED_HomeSelection)old_selection, (OLED_HomeSelection)selection);
       }
 
       if (redraw_pending != 0U)
       {
+        if (motor_oled_guard_active == 0U)
+        {
+          motor_pwm_target = motor_pwm_active;
+          motor_pwm_pending = 0U;
+          motor_pwm_due_tick = 0U;
+          motor_oled_guard_active = 1U;
+          motor_oled_guard_waiting_refresh = 0U;
+          __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0U);
+          motor_pwm_active = 0U;
+          HAL_Delay(MOTOR_PWM_OLED_GUARD_MS);
+        }
         if (page == (uint8_t)APP_PAGE_HOME)
         {
           OLED_ShowHomePage((OLED_HomeSelection)selection);
@@ -901,9 +1254,44 @@ int main(void)
         }
       }
 
-      if ((motor_pending != 0U) && (page == (uint8_t)APP_PAGE_MOTOR))
+      if (motor_pending != 0U)
       {
-        OLED_UpdateMotorState((OLED_MotorState)motor_state);
+        if (page == (uint8_t)APP_PAGE_MOTOR)
+        {
+          OLED_UpdateMotorState((OLED_MotorState)motor_state);
+        }
+        if (motor_stop_after_refresh != 0U)
+        {
+          motor_pwm_target = 0U;
+          motor_pwm_pending = 0U;
+          motor_pwm_due_tick = 0U;
+          motor_pwm_active = 0U;
+          motor_stop_after_refresh = 0U;
+        }
+        else
+        {
+          motor_pwm_due_tick = HAL_GetTick() + MOTOR_PWM_OLED_GUARD_MS;
+          motor_pwm_pending = 1U;
+        }
+        motor_oled_guard_active = 0U;
+      }
+
+      if (((transition_pending != 0U) || (redraw_pending != 0U)) && (motor_oled_guard_active != 0U) && (motor_pending == 0U))
+      {
+        if (motor_stop_after_refresh != 0U)
+        {
+          motor_pwm_target = 0U;
+          motor_pwm_pending = 0U;
+          motor_pwm_due_tick = 0U;
+          motor_pwm_active = 0U;
+          motor_stop_after_refresh = 0U;
+        }
+        else
+        {
+          motor_pwm_due_tick = HAL_GetTick() + MOTOR_PWM_OLED_GUARD_MS;
+          motor_pwm_pending = 1U;
+        }
+        motor_oled_guard_active = 0U;
       }
 
       if ((servo_pending != 0U) && (page == (uint8_t)APP_PAGE_SERVO))

@@ -53,6 +53,7 @@ void OLED_Fill(uint16_t color);
 void OLED_PlayBootAnimation(void);
 void OLED_ShowLockPage(void);
 void OLED_ShowLockInputPage(const uint8_t *code, uint8_t length, uint8_t error);
+void OLED_ShowAuthLockPage(uint8_t remaining_seconds);
 void OLED_ShowUnlockSuccessPage(void);
 void OLED_ShowUnlockDeniedPage(uint8_t retry_count);
 void OLED_ShowRfidEnrollPage(void);
